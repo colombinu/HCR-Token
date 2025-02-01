@@ -11,103 +11,118 @@ contract HCRToken is ERC20, Ownable {
     uint256 public totalSupplyLimit;
     uint256 public burnRate;
     uint256 public rebirthMultiplier;
+    uint256 public lastPhaseChange;
+    uint256 public minTimeBetweenPhases = 90 days;
+    uint256 public minTradingVolume = 1000000 * 10**18;
+    uint256 public requiredVotesPercentage = 50;
+    uint256 public governanceRewardPool;
+
+    uint256 public lambda;
+    uint256 public alpha;
+    uint256 public beta;
+
     mapping(address => bool) public collapsedParticipants;
-    
-    // L1 + L2 Bridge (Ethereum + Optimism)
+    mapping(address => uint256) public lockedTokens;
+    mapping(uint256 => uint256) public phaseVotes;
+    mapping(address => address) public delegatee;
+    mapping(address => bool) public delegateApproval;
+    mapping(address => uint256) public delegatedVotes;
+    mapping(uint256 => uint256) public proposalEndTime;
+    mapping(address => uint256) public pendingL1Transfers;
+    mapping(address => uint256) public pendingL2Transfers;
     mapping(address => uint256) public l2Balances;
+
+    struct Proposal {
+        string description;
+        string parameter;
+        uint256 newValue;
+        uint256 votesFor;
+        uint256 votesAgainst;
+        bool executed;
+        uint256 endTime;
+    }
+    mapping(uint256 => Proposal) public proposals;
+    uint256 public proposalCount;
+
     event TokensBridgedToL2(address indexed user, uint256 amount);
     event TokensBridgedToL1(address indexed user, uint256 amount);
-    
-    // DAO-controlled parameters
-    uint256 public lambda; // Emission slowdown coefficient
-    uint256 public alpha;  // % of tokens sent to pool in Collapse
-    uint256 public beta;   // % of tokens burned by DAO
-    uint256 public gamma;  // % of tokens converted to next phase
-    uint256 public delta;  // Conversion coefficient in Rebirth
-    
     event PhaseChanged(Phase newPhase);
     event TokensBurned(address indexed user, uint256 amount);
     event TokensRebirthed(address indexed user, uint256 amount);
     event DAOParameterChanged(string parameter, uint256 newValue);
-    
+    event TokensLockedForVote(address indexed user, uint256 amount);
+
     constructor(uint256 _initialSupply, uint256 _totalSupplyLimit) 
         ERC20("HCR-Token", "HCR") 
         Ownable(msg.sender) 
     {
         _mint(msg.sender, _initialSupply);
         totalSupplyLimit = _totalSupplyLimit;
-        burnRate = 10; // Default burn rate (10%)
-        rebirthMultiplier = 2; // Default rebirth multiplier
-        lambda = 5;  // Default emission slowdown
-        alpha = 50;  // 50% of tokens go to the pool in Collapse
-        beta = 20;   // 20% of tokens are burned by DAO
-        gamma = 30;  // 30% of tokens are converted
-        delta = 100; // 100% of converted tokens return in Rebirth
+        burnRate = 10;
+        rebirthMultiplier = 2;
         currentPhase = Phase.Expansion;
+        lastPhaseChange = block.timestamp;
+        governanceRewardPool = 1000000 * 10**decimals();
     }
 
-    modifier onlyDAO() {
-        require(msg.sender == owner(), "Only DAO can change this");
+    modifier canProposePhaseChange() {
+        require(balanceOf(msg.sender) >= totalSupply() / 20, "Not enough tokens to propose");
+        require(block.timestamp >= lastPhaseChange + minTimeBetweenPhases, "Not enough time has passed");
+        require(getTradingVolume() >= minTradingVolume, "Trading volume too low for phase change");
         _;
     }
 
-    function changePhase(Phase newPhase) external onlyDAO {
-        require(newPhase != currentPhase, "Already in this phase");
-        currentPhase = newPhase;
-        emit PhaseChanged(newPhase);
-    }
-
-    function updateDAOParameter(string memory parameter, uint256 newValue) external onlyDAO {
-        if (keccak256(bytes(parameter)) == keccak256(bytes("lambda"))) {
-            lambda = newValue;
-        } else if (keccak256(bytes(parameter)) == keccak256(bytes("alpha"))) {
-            alpha = newValue;
-        } else if (keccak256(bytes(parameter)) == keccak256(bytes("beta"))) {
-            beta = newValue;
-        } else if (keccak256(bytes(parameter)) == keccak256(bytes("gamma"))) {
-            gamma = newValue;
-        } else if (keccak256(bytes(parameter)) == keccak256(bytes("delta"))) {
-            delta = newValue;
+    function confirmBridgeTransfer(uint256 amount, bool toL2) external {
+        require(amount > 0, "Amount must be greater than zero");
+        if (toL2) {
+            require(balanceOf(msg.sender) >= amount, "Insufficient L1 balance");
+            pendingL2Transfers[msg.sender] += amount;
         } else {
-            revert("Invalid parameter");
+            require(l2Balances[msg.sender] >= amount, "Insufficient L2 balance");
+            pendingL1Transfers[msg.sender] += amount;
         }
-        emit DAOParameterChanged(parameter, newValue);
     }
 
-    function burnTokens(uint256 amount) external {
-        require(currentPhase == Phase.Collapse, "Burning allowed only in Collapse phase");
-        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
-        
-        uint256 burnAmount = (amount * burnRate) / 100;
-        _burn(msg.sender, burnAmount);
-        collapsedParticipants[msg.sender] = true;
-        emit TokensBurned(msg.sender, burnAmount);
-    }
-
-    function rebirthTokens() external {
-        require(currentPhase == Phase.Rebirth, "Rebirth allowed only in Rebirth phase");
-        require(collapsedParticipants[msg.sender], "User didn't participate in Collapse");
-        
-        uint256 rebirthAmount = (balanceOf(msg.sender) * rebirthMultiplier * delta) / 100;
-        require(totalSupply() + rebirthAmount <= totalSupplyLimit, "Rebirth limit reached");
-        
-        _mint(msg.sender, rebirthAmount);
-        collapsedParticipants[msg.sender] = false;
-        emit TokensRebirthed(msg.sender, rebirthAmount);
-    }
-
-    // L1 to L2 Bridge Mechanism
     function bridgeToL2(uint256 amount) external {
-        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+        require(pendingL2Transfers[msg.sender] >= amount, "Transfer not confirmed");
         _burn(msg.sender, amount);
         l2Balances[msg.sender] += amount;
+        pendingL2Transfers[msg.sender] -= amount;
         emit TokensBridgedToL2(msg.sender, amount);
     }
 
     function bridgeToL1(uint256 amount) external {
-        require(l2Balances[msg.sender] >= amount, "Insufficient L2 balance");
+        require(pendingL1Transfers[msg.sender] >= amount, "Transfer not confirmed");
         l2Balances[msg.sender] -= amount;
         _mint(msg.sender, amount);
+        pendingL1Transfers[msg.sender] -= amount;
         emit TokensBridgedToL1(msg.sender, amount);
+    }
+
+    function executeProposal(uint256 proposalId) external {
+        Proposal storage proposal = proposals[proposalId];
+        require(msg.sender == tx.origin, "Contracts cannot execute proposals");
+        require(block.timestamp >= proposal.endTime, "Voting period is not over yet");
+        require(!proposal.executed, "Proposal already executed");
+        require(proposal.votesFor > proposal.votesAgainst, "Not enough votes in favor");
+        
+        if (keccak256(bytes(proposal.parameter)) == keccak256(bytes("lambda"))) {
+            require(proposal.newValue > 0 && proposal.newValue <= 10, "Invalid lambda value");
+            lambda = proposal.newValue;
+        } else if (keccak256(bytes(proposal.parameter)) == keccak256(bytes("alpha"))) {
+            require(proposal.newValue >= 10 && proposal.newValue <= 100, "Invalid alpha value");
+            alpha = proposal.newValue;
+        } else if (keccak256(bytes(proposal.parameter)) == keccak256(bytes("beta"))) {
+            require(proposal.newValue >= 0 && proposal.newValue <= 50, "Invalid beta value");
+            beta = proposal.newValue;
+        } else {
+            revert("Invalid parameter");
+        }
+        
+        proposal.executed = true;
+    }
+
+    function getTradingVolume() public pure returns (uint256) {
+        return 1000000 * 10**18;
     }
 }
